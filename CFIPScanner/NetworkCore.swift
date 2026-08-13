@@ -263,14 +263,24 @@ func testOne(ip: String, port: Int, timeout: TimeInterval, strictTLS: Bool, sni:
 
 // MARK: - 下载测速
 
-/// 通过 ip:port 下载约 10MB，返回平均下载速度(Mbps)，失败返回 nil
+/// 带重试的 TCP 连接：应对关 VPN / 网络抖动时偶发的立即失败
+private func connectRetry(ip: String, port: Int, timeout: TimeInterval, attempts: Int = 2) -> (fd: Int32, ms: Double)? {
+    for i in 0..<max(1, attempts) {
+        if let r = tcpConnect(ip: ip, port: port, timeout: timeout) { return r }
+        if i < attempts - 1 { usleep(300_000) }  // 失败后等 0.3s 再试
+    }
+    return nil
+}
+
+/// 通过 ip:port 下载约 50MB，返回平均下载速度(Mbps)，失败返回 nil。
+/// 样本量从 10MB 提升到 50MB，摊平 VPN 前期突发缓冲，让结果更接近真实持续吞吐。
 func downloadSpeed(ip: String,
                    port: Int,
-                   maxBytes: Int = 10_000_000,
+                   maxBytes: Int = 50_000_000,
                    timeout: TimeInterval = 15,
                    sni: String = "speed.cloudflare.com",
                    progress: ((Int, Double) -> Void)? = nil) -> Double? {
-    guard let (fd, _) = tcpConnect(ip: ip, port: port, timeout: timeout) else { return nil }
+    guard let (fd, _) = connectRetry(ip: ip, port: port, timeout: timeout) else { return nil }
     guard let tls = TLSSocket(fd: fd, sni: sni, timeout: timeout) else {
         Darwin.close(fd)
         return nil
@@ -333,7 +343,7 @@ func uploadSpeed(ip: String,
                  timeout: TimeInterval = 15,
                  sni: String = "speed.cloudflare.com",
                  progress: ((Int, Double) -> Void)? = nil) -> Double? {
-    guard let (fd, _) = tcpConnect(ip: ip, port: port, timeout: timeout) else { return nil }
+    guard let (fd, _) = connectRetry(ip: ip, port: port, timeout: timeout) else { return nil }
     guard let tls = TLSSocket(fd: fd, sni: sni, timeout: timeout) else {
         Darwin.close(fd)
         return nil
