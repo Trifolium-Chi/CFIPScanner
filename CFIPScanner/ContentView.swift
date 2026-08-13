@@ -34,6 +34,9 @@ struct ContentView: View {
     @State private var showFolderSheet = false
     @State private var alertMessage: AlertMessage?
 
+    // 输出文本（可编辑）
+    @State private var outputEditableText = ""
+
     // 导出
     @State private var showShareSheet = false
     @State private var exportURL: URL?
@@ -256,9 +259,16 @@ struct ContentView: View {
                 ScrollView(.horizontal, showsIndicators: true) {
                     VStack(alignment: .leading, spacing: 0) {
                         headerRow
-                        ForEach(Array(scanner.displayResults().enumerated()), id: \.element.id) { idx, r in
-                            resultRow(idx: idx, r: r)
+                        ScrollView(.vertical, showsIndicators: true) {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(Array(scanner.displayResults().enumerated()), id: \.element.id) { idx, r in
+                                    resultRow(idx: idx, r: r)
+                                        .frame(height: 26)
+                                }
+                            }
+                            .fixedSize(horizontal: true, vertical: false)
                         }
+                        .frame(height: 260)
                     }
                     .fixedSize(horizontal: true, vertical: false)
                 }
@@ -329,37 +339,24 @@ struct ContentView: View {
 
     private var outputCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("4. 输出文本（可复制）").font(.headline)
-            ScrollView([.horizontal, .vertical], showsIndicators: true) {
-                if outputLines.isEmpty {
-                    Text("暂无数据")
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .padding(6)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
-                    VStack(alignment: .leading, spacing: 1) {
-                        ForEach(outputLines, id: \.self) { line in
-                            Text(line)
-                                .font(.system(size: 11, design: .monospaced))
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-                        }
-                    }
-                    .padding(6)
-                }
-            }
-            .frame(height: 140)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.systemBackground))
-            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(.systemGray4)))
+            Text("4. 输出文本（可编辑 / 可复制）").font(.headline)
+            TextEditor(text: $outputEditableText)
+                .font(.system(size: 11, design: .monospaced))
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+                .frame(height: 140)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(.systemBackground))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(.systemGray4)))
+                .onAppear { syncOutputText() }
+                .onChange(of: scanner.outputText) { _ in syncOutputText() }
 
             HStack {
                 Button("复制") {
-                    UIPasteboard.general.string = scanner.outputText
+                    UIPasteboard.general.string = outputEditableText
                 }
                 .buttonStyle(FilledButtonStyle(color: .cfBlue))
-                .disabled(scanner.outputText.isEmpty)
+                .disabled(outputEditableText.isEmpty)
 
                 Button("导出可用IP") { export() }
                     .buttonStyle(FilledButtonStyle(color: .cfGreen))
@@ -371,10 +368,10 @@ struct ContentView: View {
         .cornerRadius(10)
     }
 
-    private var outputLines: [String] {
-        let text = scanner.outputText
-        if text.isEmpty { return [] }
-        return text.components(separatedBy: "\n").filter { !$0.isEmpty }
+    private func syncOutputText() {
+        if !scanner.outputText.isEmpty && outputEditableText != scanner.outputText {
+            outputEditableText = scanner.outputText
+        }
     }
 
     // MARK: - Actions
