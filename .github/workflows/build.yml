@@ -1,0 +1,42 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 显示 Xcode 版本
+        run: xcodebuild -version
+
+      - name: 编译（无签名）
+        run: |
+          xcodebuild \
+            -project CFIPScanner.xcodeproj \
+            -scheme CFIPScanner \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包为 IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/CFIPScanner.app Payload/
+          zip -r CFIPScanner.ipa Payload
+          ls -lh CFIPScanner.ipa
+
+      - name: 上传 IPA 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: CFIPScanner-ipa
+          path: CFIPScanner.ipa
