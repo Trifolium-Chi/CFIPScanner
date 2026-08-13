@@ -70,7 +70,7 @@ struct ContentView: View {
             }
         }
         .fileImporter(isPresented: $showFileImporter,
-                      allowedContentTypes: [.text, .plainText, .data],
+                      allowedContentTypes: [.item],
                       allowsMultipleSelection: false) { result in
             handleImport(result)
         }
@@ -369,7 +369,26 @@ struct ContentView: View {
             guard let url = urls.first else { return }
             let access = url.startAccessingSecurityScopedResource()
             defer { if access { url.stopAccessingSecurityScopedResource() } }
-            let text = try String(contentsOf: url, encoding: .utf8)
+
+            let data = try Data(contentsOf: url)
+            guard !data.isEmpty else {
+                throw NSError(domain: "import", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "文件为空，无法导入"])
+            }
+            // 先按 utf-8，失败再按 gbk 解析，兼容 Windows 记事本/微信等常见编码
+            let text: String
+            if let t = String(data: data, encoding: .utf8) {
+                text = t
+            } else {
+                let gbk = CFStringConvertEncodingToNSStringEncoding(
+                    CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
+                if let t = String(data: data, encoding: String.Encoding(rawValue: gbk)) {
+                    text = t
+                } else {
+                    throw NSError(domain: "import", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "文件编码无法识别（仅支持 UTF-8 / GBK）"])
+                }
+            }
             scanner.importContent(text, filename: url.lastPathComponent)
         } catch {
             alertMessage = AlertMessage(message: "读取文件失败：\(error.localizedDescription)")
