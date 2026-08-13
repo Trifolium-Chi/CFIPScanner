@@ -11,6 +11,10 @@ import Foundation
 import Security
 import Darwin
 
+// SecureTransport 中未在 Swift 里暴露为符号的状态码（数值取自 Apple SecureTransport.h）
+private let kErrSSLWouldBlock: OSStatus = -9803
+private let kErrSSLServerAuthCompleted: OSStatus = -9841
+
 // MARK: - SSL 读写回调（C 函数）
 
 private func sslReadFunc(_ connection: SSLConnectionRef,
@@ -45,11 +49,13 @@ final class TLSSocket {
     let ctx: SSLContext
     let fd: Int32
     private let fdPtr: UnsafeMutablePointer<Int32>
+    private let ioTimeoutMs: Int32
 
-    init?(fd: Int32, sni: String) {
+    init?(fd: Int32, sni: String, timeout: TimeInterval) {
         guard let ctx = SSLCreateContext(nil, .clientSide, .streamType) else { return nil }
         self.ctx = ctx
         self.fd = fd
+        self.ioTimeoutMs = max(1000, Int32(timeout * 1000))
 
         // 将 fd 放入堆内存，作为 SSLConnectionRef 传给 Security framework，
         // 避免局部变量指针失效
@@ -68,45 +74,90 @@ final class TLSSocket {
             SSLSetPeerDomainName(ctx, cstr, strlen(cstr))
         }
 
-        // 忽略证书验证
+        // 忽略证书验证（等效于 Python 版 ssl.CERT_NONE）
         _ = SSLSetSessionOption(ctx, .breakOnServerAuth, true)
+    }
+
+    /// 等待 fd 可读/可写，超时或出错返回 false
+    private func waitFd(events: Int16, timeoutMs: Int32) -> Bool {
+        var pfd = pollfd(fd: fd, events: events, revents: 0)
+        var remaining = timeoutMs
+        while remaining > 0 {
+            pfd.revents = 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            let r = poll(&pfd, 1, remaining)
+            if r > 0 { return true }
+            if r == 0 { return false }                    // 超时
+            if errno == EINTR {                            // 被信号打断，继续等
+                let elapsed = Int32((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
+                remaining -= max(elapsed, 1)
+                continue
+            }
+            return false
+        }
+        return false
     }
 
     /// 执行握手，返回是否成功
     func handshake() -> Bool {
-        // errSSLServerAuthCompleted = -9841（SecureTransport 常量，Swift 中未直接暴露为符号）
-        let errServerAuthCompleted: OSStatus = -9841
         var status = SSLHandshake(ctx)
         // .breakOnServerAuth 会让握手在服务器证书认证阶段暂停并返回
         // errSSLServerAuthCompleted；此时继续握手即等效于跳过证书验证，
         // 与原版 Python 的 ssl.CERT_NONE 行为一致。
-        if status == errServerAuthCompleted {
+        // 底层 socket 短暂非阻塞或网络抖动时 SSLHandshake 会返回 errSSLWouldBlock，
+        // 需等待 socket 就绪后重试，避免“一点击就立即失败”。
+        while status == kErrSSLWouldBlock || status == kErrSSLServerAuthCompleted {
+            if status == kErrSSLWouldBlock {
+                guard waitFd(events: Int16(POLLIN | POLLOUT), timeoutMs: ioTimeoutMs) else { return false }
+            }
             status = SSLHandshake(ctx)
         }
         return status == noErr
     }
 
-    /// 写入数据，返回是否全部写出
+    /// 写入数据，返回是否全部写出（自动处理部分写入与 WouldBlock）
     func write(_ data: Data) -> Bool {
-        var written = 0
-        let status = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OSStatus in
-            SSLWrite(ctx, raw.baseAddress!, data.count, &written)
+        guard !data.isEmpty else { return true }
+        var total = 0
+        let count = data.count
+        while total < count {
+            var written = 0
+            let status = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OSStatus in
+                SSLWrite(ctx, raw.baseAddress! + total, count - total, &written)
+            }
+            if status == noErr {
+                if written <= 0 { return false }
+                total += written
+                continue
+            }
+            if status == kErrSSLWouldBlock {
+                guard waitFd(events: Int16(POLLOUT), timeoutMs: ioTimeoutMs) else { return false }
+                continue
+            }
+            return false
         }
-        return status == noErr && written > 0
+        return true
     }
 
     /// 读入最多 maxLen 字节，返回实际读到的数据（空表示连接关闭/出错）
     func read(maxLen: Int) -> Data {
         var buf = [UInt8](repeating: 0, count: maxLen)
-        var processed = 0
-        let status = buf.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> OSStatus in
-            SSLRead(ctx, raw.baseAddress!, maxLen, &processed)
-        }
-        if status != noErr && status != OSStatus(errSSLClosedGraceful) && status != OSStatus(errSSLClosedAbort) {
+        while true {
+            var processed = 0
+            let status = buf.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> OSStatus in
+                SSLRead(ctx, raw.baseAddress!, maxLen, &processed)
+            }
+            if status == noErr {
+                return processed > 0 ? Data(buf[0..<processed]) : Data()
+            }
+            if status == kErrSSLWouldBlock {
+                guard waitFd(events: Int16(POLLIN), timeoutMs: ioTimeoutMs) else { return Data() }
+                continue
+            }
+            // 连接关闭（errSSLClosedGraceful / errSSLClosedAbort 等）：若本次已读到数据则返回
+            if processed > 0 { return Data(buf[0..<processed]) }
             return Data()
         }
-        guard processed > 0 else { return Data() }
-        return Data(buf[0..<processed])
     }
 
     func close() {
@@ -198,7 +249,7 @@ func testOne(ip: String, port: Int, timeout: TimeInterval, strictTLS: Bool, sni:
         Darwin.close(fd)
         return (tcpMs, nil)
     }
-    guard let tls = TLSSocket(fd: fd, sni: sni) else {
+    guard let tls = TLSSocket(fd: fd, sni: sni, timeout: timeout) else {
         Darwin.close(fd)
         return nil
     }
@@ -220,7 +271,7 @@ func downloadSpeed(ip: String,
                    sni: String = "speed.cloudflare.com",
                    progress: ((Int, Double) -> Void)? = nil) -> Double? {
     guard let (fd, _) = tcpConnect(ip: ip, port: port, timeout: timeout) else { return nil }
-    guard let tls = TLSSocket(fd: fd, sni: sni) else {
+    guard let tls = TLSSocket(fd: fd, sni: sni, timeout: timeout) else {
         Darwin.close(fd)
         return nil
     }
@@ -283,7 +334,7 @@ func uploadSpeed(ip: String,
                  sni: String = "speed.cloudflare.com",
                  progress: ((Int, Double) -> Void)? = nil) -> Double? {
     guard let (fd, _) = tcpConnect(ip: ip, port: port, timeout: timeout) else { return nil }
-    guard let tls = TLSSocket(fd: fd, sni: sni) else {
+    guard let tls = TLSSocket(fd: fd, sni: sni, timeout: timeout) else {
         Darwin.close(fd)
         return nil
     }
@@ -299,18 +350,14 @@ func uploadSpeed(ip: String,
     guard let reqData = req.data(using: .utf8), tls.write(reqData) else { return nil }
 
     let chunk = [UInt8](repeating: 48, count: 65536) // 字符 "0"
+    let chunkData = Data(chunk)
     var total = 0
     let t0 = DispatchTime.now().uptimeNanoseconds
     var lastCb = 0.0
 
     while total < maxBytes {
-        let sent = chunk.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
-            var n = 0
-            let status = SSLWrite(tls.ctx, raw.baseAddress!, chunk.count, &n)
-            return status == noErr ? n : 0
-        }
-        if sent <= 0 { break }
-        total += sent
+        if !tls.write(chunkData) { break }
+        total += chunk.count
 
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000.0
         if let progress = progress, elapsed - lastCb >= 0.5 {
