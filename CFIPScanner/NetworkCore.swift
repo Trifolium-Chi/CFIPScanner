@@ -74,11 +74,13 @@ final class TLSSocket {
 
     /// 执行握手，返回是否成功
     func handshake() -> Bool {
+        // errSSLServerAuthCompleted = -9841（SecureTransport 常量，Swift 中未直接暴露为符号）
+        let errServerAuthCompleted: OSStatus = -9841
         var status = SSLHandshake(ctx)
         // .breakOnServerAuth 会让握手在服务器证书认证阶段暂停并返回
         // errSSLServerAuthCompleted；此时继续握手即等效于跳过证书验证，
         // 与原版 Python 的 ssl.CERT_NONE 行为一致。
-        if status == errSSLServerAuthCompleted {
+        if status == errServerAuthCompleted {
             status = SSLHandshake(ctx)
         }
         return status == noErr
