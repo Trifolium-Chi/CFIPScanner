@@ -31,6 +31,7 @@ struct ContentView: View {
     // 文件导入
     @State private var showFileImporter = false
     @State private var showPasteSheet = false
+    @State private var showFolderSheet = false
     @State private var alertMessage: AlertMessage?
 
     // 导出
@@ -89,6 +90,11 @@ struct ContentView: View {
                 scanner.importContent(text, filename: "手动粘贴")
             }
         }
+        .sheet(isPresented: $showFolderSheet) {
+            FolderImportSheet { url in
+                importFromFolder(url)
+            }
+        }
         .sheet(isPresented: $showRegionPicker) {
             let options = scanner.regionOptions()
             MultiSelectSheet(
@@ -138,17 +144,19 @@ struct ContentView: View {
     private var importCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("1. 导入 IP 文件").font(.headline)
-            HStack {
+            HStack(spacing: 8) {
                 Button("选择文件") { showFileImporter = true }
                     .buttonStyle(FilledButtonStyle(color: .cfBlue))
+                Button("App文件夹导入") { showFolderSheet = true }
+                    .buttonStyle(FilledButtonStyle(color: .cfGreen))
                 Button("粘贴导入") { showPasteSheet = true }
                     .buttonStyle(FilledButtonStyle(color: .cfOrange))
-                Text(scanner.filename.isEmpty
-                     ? "尚未导入文件"
-                     : "已导入 \(scanner.countImported) 条 IP（去重后）")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
             }
+            Text(scanner.filename.isEmpty
+                 ? "尚未导入文件"
+                 : "已导入 \(scanner.countImported) 条 IP（去重后）")
+                .font(.footnote)
+                .foregroundColor(.secondary)
         }
         .padding()
         .background(Color(.secondarySystemBackground))
@@ -403,6 +411,19 @@ struct ContentView: View {
         }
     }
 
+    private func importFromFolder(_ url: URL) {
+        do {
+            let data = try Data(contentsOf: url)
+            guard let text = decodeImportText(data) else {
+                alertMessage = AlertMessage(message: "文件编码无法识别（仅支持 UTF-8 / GBK）")
+                return
+            }
+            scanner.importContent(text, filename: url.lastPathComponent)
+        } catch {
+            alertMessage = AlertMessage(message: "读取文件失败：\(error.localizedDescription)")
+        }
+    }
+
     private func startScan() {
         let threadsVal = Int(threads) ?? 200
         let timeoutVal = Double(timeout) ?? 3.0
@@ -564,6 +585,97 @@ extension Color {
     static let cfGreen = Color(red: 0.40, green: 0.76, blue: 0.23)     // #67c23a
     static let cfOrange = Color(red: 0.90, green: 0.63, blue: 0.24)    // #e6a23c
     static let cfGray = Color(red: 0.56, green: 0.58, blue: 0.60)      // #909399
+}
+
+// MARK: - 文本解码（UTF-8 / GBK，供文件导入与文件夹导入共用）
+
+private func decodeImportText(_ data: Data) -> String? {
+    if let t = String(data: data, encoding: .utf8) { return t }
+    let gbk = CFStringConvertEncodingToNSStringEncoding(
+        CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
+    if let t = String(data: data, encoding: String.Encoding(rawValue: gbk)) { return t }
+    return nil
+}
+
+// MARK: - App 文件夹导入面板（绕开系统文件选择器）
+
+struct FolderImportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let onImport: (URL) -> Void
+    @State private var files: [URL] = []
+    @State private var errorText: String?
+
+    var body: some View {
+        NavigationView {
+            Group {
+                if let err = errorText {
+                    VStack(spacing: 12) {
+                        Text("读取 App 文件夹失败").font(.headline)
+                        Text(err).font(.footnote).foregroundColor(.secondary)
+                    }
+                    .padding()
+                } else if files.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("App 文件夹里还没有文件").font(.headline)
+                        Text("""
+请先把 TXT 文件放进本 App 的文件夹：
+
+方法一（手机）：打开「文件」App →「我的 iPhone」→「优选IP筛选」文件夹，长按 TXT 文件 → 点「移动」→ 选择该文件夹。
+
+方法二（电脑）：用数据线连接电脑，在 iTunes / 访达 / 爱思助手 的「文件共享」里把 TXT 拖进本 App。
+
+放好后点右上角「刷新」即可看到文件。
+""")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding()
+                } else {
+                    List(files, id: \.self) { url in
+                        Button {
+                            onImport(url)
+                            dismiss()
+                        } label: {
+                            HStack {
+                                Image(systemName: "doc.text")
+                                    .foregroundColor(.cfBlue)
+                                Text(url.lastPathComponent)
+                                Spacer()
+                            }
+                        }
+                    }
+                    .listStyle(InsetGroupedListStyle())
+                }
+            }
+            .navigationBarTitle("App 文件夹导入", displayMode: .inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("刷新") { loadFiles() }
+                }
+            }
+            .onAppear { loadFiles() }
+        }
+    }
+
+    private func loadFiles() {
+        errorText = nil
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            errorText = "无法定位 App 文件夹"
+            return
+        }
+        do {
+            let all = try FileManager.default.contentsOfDirectory(at: docs, includingPropertiesForKeys: nil)
+            files = all
+                .filter { !$0.lastPathComponent.hasPrefix(".") && !$0.hasDirectoryPath }
+                .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
+        } catch {
+            errorText = error.localizedDescription
+        }
+    }
 }
 
 // MARK: - 粘贴导入面板（文件选择器无法点选文件时的兜底方案）
