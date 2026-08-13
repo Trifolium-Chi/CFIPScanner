@@ -74,7 +74,14 @@ final class TLSSocket {
 
     /// 执行握手，返回是否成功
     func handshake() -> Bool {
-        return SSLHandshake(ctx) == noErr
+        var status = SSLHandshake(ctx)
+        // .breakOnServerAuth 会让握手在服务器证书认证阶段暂停并返回
+        // errSSLServerAuthCompleted；此时继续握手即等效于跳过证书验证，
+        // 与原版 Python 的 ssl.CERT_NONE 行为一致。
+        if status == errSSLServerAuthCompleted {
+            status = SSLHandshake(ctx)
+        }
+        return status == noErr
     }
 
     /// 写入数据，返回是否全部写出
@@ -126,7 +133,7 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
     }
     addr.sin_addr = inAddr
 
-    // 设置收发超时
+    // 设置收发超时（对 SSLRead/SSLWrite 底层的 read/write 生效）
     let secs = Int(timeout)
     let usecs = Int((timeout - Double(secs)) * 1_000_000)
     var tv = timeval(tv_sec: secs, tv_usec: Int32(usecs))
@@ -137,18 +144,48 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
     }
 
+    // 非阻塞 connect + poll，实现连接超时（与 Python sock.settimeout 一致）
+    let flags = fcntl(fd, F_GETFL, 0)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
     let t0 = DispatchTime.now().uptimeNanoseconds
     let ret = withUnsafePointer(to: &addr) { p in
         p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
             connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
+
+    if ret != 0 {
+        if errno == EINPROGRESS {
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let pollRet = poll(&pfd, 1, Int32(timeout * 1000))
+            if pollRet <= 0 {
+                _ = fcntl(fd, F_SETFL, flags)
+                Darwin.close(fd)
+                return nil
+            }
+            var sockErr: Int32 = 0
+            var sockErrLen = socklen_t(MemoryLayout<Int32>.size)
+            _ = withUnsafeMutablePointer(to: &sockErr) { p in
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, p, &sockErrLen)
+            }
+            if sockErr != 0 {
+                _ = fcntl(fd, F_SETFL, flags)
+                Darwin.close(fd)
+                return nil
+            }
+        } else {
+            _ = fcntl(fd, F_SETFL, flags)
+            Darwin.close(fd)
+            return nil
+        }
+    }
+
+    // 恢复阻塞模式
+    _ = fcntl(fd, F_SETFL, flags)
+
     let t1 = DispatchTime.now().uptimeNanoseconds
     let ms = Double(t1 - t0) / 1_000_000.0
-    guard ret == 0 else {
-        close(fd)
-        return nil
-    }
     return (fd, ms)
 }
 
