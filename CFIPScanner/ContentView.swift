@@ -70,7 +70,7 @@ struct ContentView: View {
             }
         }
         .fileImporter(isPresented: $showFileImporter,
-                      allowedContentTypes: [.plainText],
+                      allowedContentTypes: [.text, .plainText, .data],
                       allowsMultipleSelection: false) { result in
             handleImport(result)
         }
@@ -134,6 +134,7 @@ struct ContentView: View {
             Text("1. 导入 IP 文件").font(.headline)
             HStack {
                 Button("选择文件") { showFileImporter = true }
+                    .buttonStyle(FilledButtonStyle(color: .cfBlue))
                 Text(scanner.filename.isEmpty
                      ? "尚未导入文件"
                      : "已导入 \(scanner.countImported) 条 IP（去重后）")
@@ -173,6 +174,7 @@ struct ContentView: View {
                     showRegionPicker = true
                 }
                 .font(.footnote)
+                .buttonStyle(FilledButtonStyle(color: .cfOrange, vertical: 5, horizontal: 12))
                 Text("不勾选任何地区 = 扫描全部地区")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -182,11 +184,11 @@ struct ContentView: View {
                 Button(scanner.running ? "扫描中…" : "开始扫描") {
                     startScan()
                 }
-                .buttonStyle(BorderlessButtonStyle())
+                .buttonStyle(FilledButtonStyle(color: .cfBlue))
                 .disabled(scanner.running)
 
                 Button("停止") { scanner.stopScan() }
-                    .buttonStyle(BorderlessButtonStyle())
+                    .buttonStyle(FilledButtonStyle(color: .cfRed))
                     .disabled(!scanner.running)
             }
 
@@ -224,23 +226,25 @@ struct ContentView: View {
 
             HStack {
                 Button("地区筛选") { showResultRegionPicker = true }
+                    .buttonStyle(FilledButtonStyle(color: .cfOrange, vertical: 5, horizontal: 12))
                 Button("端口筛选") { showResultPortPicker = true }
+                    .buttonStyle(FilledButtonStyle(color: .cfOrange, vertical: 5, horizontal: 12))
                 Spacer()
             }
-            .font(.caption)
 
             if scanner.displayResults().isEmpty {
                 Text("暂无数据")
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 120)
             } else {
-                ScrollView(.horizontal) {
-                    VStack(spacing: 0) {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 0) {
                         headerRow
                         ForEach(Array(scanner.displayResults().enumerated()), id: \.element.id) { idx, r in
                             resultRow(idx: idx, r: r)
                         }
                     }
+                    .fixedSize(horizontal: true, vertical: false)
                 }
             }
         }
@@ -251,13 +255,13 @@ struct ContentView: View {
 
     private var headerRow: some View {
         HStack(spacing: 8) {
-            cellText("#", width: 30)
-            cellText("IP 地址", width: 105)
-            cellText("端口", width: 50)
-            cellText("地区", width: 95)
-            sortableHeader("TCP(ms)", key: "tcp", width: 76)
-            sortableHeader("TLS(ms)", key: "tls", width: 76)
-            cellText("测速", width: 200)
+            cellText("#", width: 36)
+            cellText("IP 地址", width: 120)
+            cellText("端口", width: 64)
+            cellText("地区", width: 110)
+            sortableHeader("TCP延迟(ms)", key: "tcp", width: 92)
+            sortableHeader("TLS延迟(ms)", key: "tls", width: 92)
+            cellText("测速", width: 220)
         }
         .font(.caption.bold())
         .padding(.vertical, 6)
@@ -287,12 +291,12 @@ struct ContentView: View {
 
     private func resultRow(idx: Int, r: ScanResult) -> some View {
         HStack(spacing: 8) {
-            cellText("\(idx + 1)", width: 30)
-            cellText(r.ip, width: 105)
-            cellText("\(r.port)", width: 50)
-            cellText(r.cc.isEmpty ? "-" : "\(r.cc)\(r.region)", width: 95)
-            cellText(String(format: "%.1f", r.tcp), width: 76)
-            cellText(r.tls.map { String(format: "%.1f", $0) } ?? "-", width: 76)
+            cellText("\(idx + 1)", width: 36)
+            cellText(r.ip, width: 120)
+            cellText("\(r.port)", width: 64)
+            cellText(r.cc.isEmpty ? "-" : "\(r.cc)\(r.region)", width: 110)
+            cellText(String(format: "%.1f", r.tcp), width: 92)
+            cellText(r.tls.map { String(format: "%.1f", $0) } ?? "-", width: 92)
             SpeedCell(r: r)
         }
         .font(.caption)
@@ -310,18 +314,51 @@ struct ContentView: View {
     private var outputCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("4. 输出文本（可复制）").font(.headline)
-            TextEditor(text: .constant(scanner.outputText))
-                .font(.system(.caption, design: .monospaced))
-                .frame(minHeight: 140)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(.systemGray4)))
-            Button("复制") {
-                UIPasteboard.general.string = scanner.outputText
+            ScrollView([.horizontal, .vertical], showsIndicators: true) {
+                if outputLines.isEmpty {
+                    Text("暂无数据")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(outputLines, id: \.self) { line in
+                            Text(line)
+                                .font(.system(size: 11, design: .monospaced))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    .padding(6)
+                }
             }
-            .disabled(scanner.outputText.isEmpty)
+            .frame(height: 140)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.systemBackground))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(.systemGray4)))
+
+            HStack {
+                Button("复制") {
+                    UIPasteboard.general.string = scanner.outputText
+                }
+                .buttonStyle(FilledButtonStyle(color: .cfBlue))
+                .disabled(scanner.outputText.isEmpty)
+
+                Button("导出可用IP") { export() }
+                    .buttonStyle(FilledButtonStyle(color: .cfGreen))
+                    .disabled(scanner.displayResults().isEmpty)
+            }
         }
         .padding()
         .background(Color(.secondarySystemBackground))
         .cornerRadius(10)
+    }
+
+    private var outputLines: [String] {
+        let text = scanner.outputText
+        if text.isEmpty { return [] }
+        return text.components(separatedBy: "\n").filter { !$0.isEmpty }
     }
 
     // MARK: - Actions
@@ -385,6 +422,7 @@ struct SpeedCell: View {
                 start()
             }
             .font(.caption2)
+            .buttonStyle(FilledButtonStyle(color: .cfGray, vertical: 3, horizontal: 10))
             .disabled(job != nil && !job!.done)
             Text(ulText)
                 .foregroundColor(.orange)
@@ -489,4 +527,33 @@ struct ShareSheet: UIViewControllerRepresentable {
 struct AlertMessage: Identifiable {
     let id = UUID()
     let message: String
+}
+
+// MARK: - 配色与按钮样式（对齐原版 Web 界面）
+
+extension Color {
+    static let cfBlue = Color(red: 0.25, green: 0.62, blue: 1.0)      // #409eff
+    static let cfRed = Color(red: 0.96, green: 0.42, blue: 0.42)       // #f56c6c
+    static let cfGreen = Color(red: 0.40, green: 0.76, blue: 0.23)     // #67c23a
+    static let cfOrange = Color(red: 0.90, green: 0.63, blue: 0.24)    // #e6a23c
+    static let cfGray = Color(red: 0.56, green: 0.58, blue: 0.60)      // #909399
+}
+
+struct FilledButtonStyle: ButtonStyle {
+    let color: Color
+    var vertical: CGFloat = 7
+    var horizontal: CGFloat = 14
+
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundColor(.white)
+            .padding(.vertical, vertical)
+            .padding(.horizontal, horizontal)
+            .background(configuration.isPressed
+                        ? color.opacity(0.8)
+                        : (isEnabled ? color : Color(.systemGray3)))
+            .cornerRadius(6)
+    }
 }
