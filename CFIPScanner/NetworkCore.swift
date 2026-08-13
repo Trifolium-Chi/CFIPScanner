@@ -9,6 +9,7 @@
 
 import Foundation
 import Security
+import Darwin
 
 // MARK: - SSL 读写回调（C 函数）
 
@@ -80,7 +81,7 @@ final class TLSSocket {
     func write(_ data: Data) -> Bool {
         var written = 0
         let status = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> OSStatus in
-            SSLWrite(ctx, raw.baseAddress, data.count, &written)
+            SSLWrite(ctx, raw.baseAddress!, data.count, &written)
         }
         return status == noErr && written > 0
     }
@@ -90,7 +91,7 @@ final class TLSSocket {
         var buf = [UInt8](repeating: 0, count: maxLen)
         var processed = 0
         let status = buf.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) -> OSStatus in
-            SSLRead(ctx, raw.baseAddress, maxLen, &processed)
+            SSLRead(ctx, raw.baseAddress!, maxLen, &processed)
         }
         if status != noErr && status != OSStatus(errSSLClosedGraceful) && status != OSStatus(errSSLClosedAbort) {
             return Data()
@@ -101,7 +102,7 @@ final class TLSSocket {
 
     func close() {
         _ = SSLClose(ctx)
-        close(fd)
+        Darwin.close(fd)
     }
 
     deinit {
@@ -128,7 +129,7 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
     // 设置收发超时
     let secs = Int(timeout)
     let usecs = Int((timeout - Double(secs)) * 1_000_000)
-    var tv = timeval(tv_sec: secs, tv_usec: usecs)
+    var tv = timeval(tv_sec: secs, tv_usec: Int32(usecs))
     _ = withUnsafePointer(to: &tv) { p in
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
     }
@@ -268,7 +269,7 @@ func uploadSpeed(ip: String,
     while total < maxBytes {
         let sent = chunk.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
             var n = 0
-            let status = SSLWrite(tls.ctx, raw.baseAddress, chunk.count, &n)
+            let status = SSLWrite(tls.ctx, raw.baseAddress!, chunk.count, &n)
             return status == noErr ? n : 0
         }
         if sent <= 0 { break }
