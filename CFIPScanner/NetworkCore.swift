@@ -133,7 +133,7 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
     }
     addr.sin_addr = inAddr
 
-    // 设置收发超时（对 SSLRead/SSLWrite 底层的 read/write 生效）
+    // 设置收发超时
     let secs = Int(timeout)
     let usecs = Int((timeout - Double(secs)) * 1_000_000)
     var tv = timeval(tv_sec: secs, tv_usec: Int32(usecs))
@@ -144,48 +144,18 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
     }
 
-    // 非阻塞 connect + poll，实现连接超时（与 Python sock.settimeout 一致）
-    let flags = fcntl(fd, F_GETFL, 0)
-    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-
     let t0 = DispatchTime.now().uptimeNanoseconds
     let ret = withUnsafePointer(to: &addr) { p in
         p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
             connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
-
-    if ret != 0 {
-        if errno == EINPROGRESS {
-            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-            let pollRet = poll(&pfd, 1, Int32(timeout * 1000))
-            if pollRet <= 0 {
-                _ = fcntl(fd, F_SETFL, flags)
-                Darwin.close(fd)
-                return nil
-            }
-            var sockErr: Int32 = 0
-            var sockErrLen = socklen_t(MemoryLayout<Int32>.size)
-            _ = withUnsafeMutablePointer(to: &sockErr) { p in
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, p, &sockErrLen)
-            }
-            if sockErr != 0 {
-                _ = fcntl(fd, F_SETFL, flags)
-                Darwin.close(fd)
-                return nil
-            }
-        } else {
-            _ = fcntl(fd, F_SETFL, flags)
-            Darwin.close(fd)
-            return nil
-        }
-    }
-
-    // 恢复阻塞模式
-    _ = fcntl(fd, F_SETFL, flags)
-
     let t1 = DispatchTime.now().uptimeNanoseconds
     let ms = Double(t1 - t0) / 1_000_000.0
+    guard ret == 0 else {
+        Darwin.close(fd)
+        return nil
+    }
     return (fd, ms)
 }
 
@@ -195,11 +165,11 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
 func testOne(ip: String, port: Int, timeout: TimeInterval, strictTLS: Bool, sni: String) -> (tcp: Double, tls: Double?)? {
     guard let (fd, tcpMs) = tcpConnect(ip: ip, port: port, timeout: timeout) else { return nil }
     if !strictTLS {
-        close(fd)
+        Darwin.close(fd)
         return (tcpMs, nil)
     }
     guard let tls = TLSSocket(fd: fd, sni: sni) else {
-        close(fd)
+        Darwin.close(fd)
         return nil
     }
     let t0 = DispatchTime.now().uptimeNanoseconds
@@ -221,7 +191,7 @@ func downloadSpeed(ip: String,
                    progress: ((Int, Double) -> Void)? = nil) -> Double? {
     guard let (fd, _) = tcpConnect(ip: ip, port: port, timeout: timeout) else { return nil }
     guard let tls = TLSSocket(fd: fd, sni: sni) else {
-        close(fd)
+        Darwin.close(fd)
         return nil
     }
     defer { tls.close() }
@@ -284,7 +254,7 @@ func uploadSpeed(ip: String,
                  progress: ((Int, Double) -> Void)? = nil) -> Double? {
     guard let (fd, _) = tcpConnect(ip: ip, port: port, timeout: timeout) else { return nil }
     guard let tls = TLSSocket(fd: fd, sni: sni) else {
-        close(fd)
+        Darwin.close(fd)
         return nil
     }
     defer { tls.close() }
@@ -300,7 +270,7 @@ func uploadSpeed(ip: String,
 
     let chunk = [UInt8](repeating: 48, count: 65536) // 字符 "0"
     var total = 0
-    var t0 = DispatchTime.now().uptimeNanoseconds
+    let t0 = DispatchTime.now().uptimeNanoseconds
     var lastCb = 0.0
 
     while total < maxBytes {
