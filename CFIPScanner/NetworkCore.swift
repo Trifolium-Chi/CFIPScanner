@@ -135,7 +135,7 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
     }
     addr.sin_addr = inAddr
 
-    // 设置收发超时
+    // 设置收发超时（对后续阻塞式 SSLRead/SSLWrite 生效）
     let secs = Int(timeout)
     let usecs = Int((timeout - Double(secs)) * 1_000_000)
     var tv = timeval(tv_sec: secs, tv_usec: Int32(usecs))
@@ -146,15 +146,43 @@ func tcpConnect(ip: String, port: Int, timeout: TimeInterval) -> (fd: Int32, ms:
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
     }
 
+    // 非阻塞 connect：先设为非阻塞，connect 立即返回，再用 poll 等待，
+    // 实现真正的「超时」控制。阻塞 connect 不受 SO_RCVTIMEO/SO_SNDTIMEO 影响，
+    // 目标不可达（如关闭 VPN 后大量 IP 不通）会长时间卡住 worker 线程。
+    let origFlags = fcntl(fd, F_GETFL, 0)
+    _ = fcntl(fd, F_SETFL, origFlags | O_NONBLOCK)
+
+    var connectErrno: Int32 = 0
     let t0 = DispatchTime.now().uptimeNanoseconds
-    let ret = withUnsafePointer(to: &addr) { p in
-        p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+    let ret = withUnsafePointer(to: &addr) { p -> Int32 in
+        let r = p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
             connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+        connectErrno = errno
+        return r
+    }
+
+    var connectOK = (ret == 0)
+    if ret < 0 && connectErrno == EINPROGRESS {
+        // 连接进行中：poll 等待可写，再读 SO_ERROR 判断最终结果
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let pr = poll(&pfd, 1, Int32(timeout * 1000))
+        if pr > 0 {
+            var sockErr: Int32 = 0
+            var optLen = socklen_t(MemoryLayout<Int32>.size)
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockErr, &optLen)
+            connectOK = (sockErr == 0)
+        } else {
+            connectOK = false
         }
     }
     let t1 = DispatchTime.now().uptimeNanoseconds
     let ms = Double(t1 - t0) / 1_000_000.0
-    guard ret == 0 else {
+
+    // 恢复阻塞模式，供后续 SSL 读写正常使用
+    _ = fcntl(fd, F_SETFL, origFlags)
+
+    guard connectOK else {
         Darwin.close(fd)
         return nil
     }

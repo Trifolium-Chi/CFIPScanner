@@ -37,30 +37,45 @@ struct ContentView: View {
     // 输出文本（可编辑）
     @State private var outputEditableText = ""
 
+    // 键盘避让
+    @State private var keyboardHeight: CGFloat = 0
+    @State private var keyboardObservers: [NSObjectProtocol] = []
+
     // 导出
     @State private var showShareSheet = false
     @State private var exportURL: URL?
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    importCard
-                    settingsCard
-                    resultsCard
-                    outputCard
-                }
-                .padding()
-            }
-            .navigationBarTitle("优选 IP 筛选工具", displayMode: .inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        export()
-                    } label: {
-                        Image(systemName: "square.and.arrow.up")
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        importCard
+                        settingsCard
+                        resultsCard
+                        outputCard
+                            .id("outputCard")
                     }
-                    .disabled(scanner.displayResults().isEmpty)
+                    .padding()
+                    .padding(.bottom, keyboardHeight)
+                }
+                .navigationBarTitle("优选 IP 筛选工具", displayMode: .inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            export()
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        .disabled(scanner.displayResults().isEmpty)
+                    }
+                }
+                .onChange(of: keyboardHeight) { h in
+                    if h > 0 {
+                        withAnimation {
+                            proxy.scrollTo("outputCard", anchor: .bottom)
+                        }
+                    }
                 }
             }
         }
@@ -73,6 +88,10 @@ struct ContentView: View {
                     }
                 }
             }
+            addKeyboardObservers()
+        }
+        .onDisappear {
+            removeKeyboardObservers()
         }
         .fileImporter(isPresented: $showFileImporter,
                       allowedContentTypes: [.item],
@@ -445,6 +464,28 @@ struct ContentView: View {
             alertMessage = AlertMessage(message: "导出失败：\(error.localizedDescription)")
         }
     }
+
+    // MARK: - 键盘避让（点击输出框时自动上移，保证复制/导出按钮可见）
+
+    private func addKeyboardObservers() {
+        let show = NotificationCenter.default.addObserver(
+            forName: UIResponder.keyboardWillShowNotification,
+            object: nil, queue: .main) { note in
+                guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+                keyboardHeight = frame.height
+            }
+        let hide = NotificationCenter.default.addObserver(
+            forName: UIResponder.keyboardWillHideNotification,
+            object: nil, queue: .main) { _ in
+                keyboardHeight = 0
+            }
+        keyboardObservers = [show, hide]
+    }
+
+    private func removeKeyboardObservers() {
+        keyboardObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        keyboardObservers = []
+    }
 }
 
 // MARK: - 测速单元格
@@ -459,22 +500,25 @@ struct SpeedCell: View {
     }
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 4) {
             Text(dlText)
                 .foregroundColor(.blue)
-                .frame(minWidth: 80, alignment: .trailing)
+                .lineLimit(1)
+                .frame(minWidth: 72, alignment: .trailing)
             Button(job == nil ? "测速" : (job!.done ? "重测" : "测速中")) {
                 start()
             }
-            .font(.caption2)
-            .buttonStyle(FilledButtonStyle(color: .cfGray, vertical: 3, horizontal: 10))
+            .font(.caption)
+            .lineLimit(1)
+            .buttonStyle(FilledButtonStyle(color: .cfGray, vertical: 4, horizontal: 8))
             .disabled(job != nil && !job!.done)
             Text(ulText)
                 .foregroundColor(.orange)
-                .frame(minWidth: 80, alignment: .leading)
+                .lineLimit(1)
+                .frame(minWidth: 72, alignment: .leading)
         }
         .font(.caption)
-        .frame(width: 200, alignment: .center)
+        .frame(width: 220, alignment: .center)
     }
 
     private var dlText: String {
