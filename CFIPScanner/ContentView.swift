@@ -30,6 +30,7 @@ struct ContentView: View {
 
     // 文件导入
     @State private var showFileImporter = false
+    @State private var showPasteSheet = false
     @State private var alertMessage: AlertMessage?
 
     // 导出
@@ -81,6 +82,11 @@ struct ContentView: View {
         .sheet(isPresented: $showShareSheet) {
             if let url = exportURL {
                 ShareSheet(items: [url])
+            }
+        }
+        .sheet(isPresented: $showPasteSheet) {
+            PasteImportSheet { text in
+                scanner.importContent(text, filename: "手动粘贴")
             }
         }
         .sheet(isPresented: $showRegionPicker) {
@@ -135,6 +141,8 @@ struct ContentView: View {
             HStack {
                 Button("选择文件") { showFileImporter = true }
                     .buttonStyle(FilledButtonStyle(color: .cfBlue))
+                Button("粘贴导入") { showPasteSheet = true }
+                    .buttonStyle(FilledButtonStyle(color: .cfOrange))
                 Text(scanner.filename.isEmpty
                      ? "尚未导入文件"
                      : "已导入 \(scanner.countImported) 条 IP（去重后）")
@@ -556,6 +564,48 @@ extension Color {
     static let cfGreen = Color(red: 0.40, green: 0.76, blue: 0.23)     // #67c23a
     static let cfOrange = Color(red: 0.90, green: 0.63, blue: 0.24)    // #e6a23c
     static let cfGray = Color(red: 0.56, green: 0.58, blue: 0.60)      // #909399
+}
+
+// MARK: - 粘贴导入面板（文件选择器无法点选文件时的兜底方案）
+
+struct PasteImportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let onImport: (String) -> Void
+    @State private var text = ""
+
+    var body: some View {
+        NavigationView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("把 IP 内容（每行一个 ip:port，或 Cloudflare 测速地址）粘贴到下方文本框，再点右上角“导入”")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                TextEditor(text: $text)
+                    .font(.system(.footnote, design: .monospaced))
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                    .padding(6)
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(8)
+                    .frame(minHeight: 220)
+            }
+            .padding()
+            .navigationBarTitle("粘贴导入", displayMode: .inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("导入") {
+                        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !t.isEmpty else { return }
+                        onImport(t)
+                        dismiss()
+                    }
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
 }
 
 struct FilledButtonStyle: ButtonStyle {
