@@ -40,11 +40,3 @@ jobs:
         with:
           name: CFIPScanner-ipa
           path: CFIPScanner.ipa
-- name: Create Release and Upload IPA
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: v1.0.${{ github.run_number }}
-        name: Build v1.0.${{ github.run_number }}
-        files: ./path/to/CFIPScanner.ipa # ⚠️ 修改为你 IPA 文件的实际路径
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
