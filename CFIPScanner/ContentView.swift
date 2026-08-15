@@ -391,7 +391,7 @@ struct ContentView: View {
 
                 Button("导出可用IP") { export() }
                     .buttonStyle(FilledButtonStyle(color: .cfGreen))
-                    .disabled(scanner.displayResults().isEmpty)
+                    .disabled(outputEditableText.isEmpty)
 
                 Button("关于工具") { showAbout = true }
                     .buttonStyle(FilledButtonStyle(color: .cfGray))
@@ -468,9 +468,16 @@ struct ContentView: View {
 
     private func export() {
         let arr = scanner.displayResults()
-        guard !arr.isEmpty else { return }
-        let lines = arr.map { exportLine($0, isp: scanner.isp) }
-        let text = lines.joined(separator: "\r\n") + "\r\n"
+        let text: String
+        if arr.isEmpty {
+            // 结果列表已被清空（例如重新导入了新文件），但输出框里还留着上次的扫描内容时，
+            // 直接导出输出框当前内容，避免“有内容却无法导出”。
+            guard !outputEditableText.isEmpty else { return }
+            text = outputEditableText
+        } else {
+            let lines = arr.map { exportLine($0, isp: scanner.isp) }
+            text = lines.joined(separator: "\r\n") + "\r\n"
+        }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("可用IP.txt")
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
