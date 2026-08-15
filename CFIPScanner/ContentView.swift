@@ -44,9 +44,9 @@ struct ContentView: View {
     // 输出文本编辑焦点（仅在该文本框聚焦且键盘弹出时，才自动滚动到输出框）
     @FocusState private var isEditingOutput: Bool
 
-    // 导出（系统“存储到文件”，可选择保存位置）
-    @State private var showExporter = false
-    @State private var exportText = ""
+    // 导出（系统分享面板：可存储到文件 / 分享到其他 App）
+    @State private var showShareSheet = false
+    @State private var exportURL: URL?
 
     // 关于工具翻页（无手势滑动，仅按钮切换）
     @State private var showAbout = false
@@ -84,15 +84,9 @@ struct ContentView: View {
             Alert(title: Text("提示"), message: Text(msg.message),
                   dismissButton: .default(Text("好")))
         }
-        .fileExporter(isPresented: $showExporter,
-                      document: TextFileDocument(text: exportText),
-                      contentType: .plainText,
-                      defaultFilename: "可用IP.txt") { result in
-            switch result {
-            case .success:
-                alertMessage = AlertMessage(message: "导出成功")
-            case .failure(let error):
-                alertMessage = AlertMessage(message: "导出失败：\(error.localizedDescription)")
+        .sheet(isPresented: $showShareSheet) {
+            if let url = exportURL {
+                ShareSheet(items: [url])
             }
         }
         .sheet(isPresented: $showPasteSheet) {
@@ -163,9 +157,12 @@ struct ContentView: View {
                 }
                 .onChange(of: keyboardHeight) { h in
                     if h > 0 && isEditingOutput {
-                        withAnimation {
-                            proxy.scrollTo("outputButtons", anchor: .bottom)
-                        }
+                        scrollToOutputButtons(proxy)
+                    }
+                }
+                .onChange(of: isEditingOutput) { editing in
+                    if editing && keyboardHeight > 0 {
+                        scrollToOutputButtons(proxy)
                     }
                 }
             }
@@ -473,8 +470,24 @@ struct ContentView: View {
         let arr = scanner.displayResults()
         guard !arr.isEmpty else { return }
         let lines = arr.map { exportLine($0, isp: scanner.isp) }
-        exportText = lines.joined(separator: "\r\n") + "\r\n"
-        showExporter = true
+        let text = lines.joined(separator: "\r\n") + "\r\n"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("可用IP.txt")
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            exportURL = url
+            showShareSheet = true
+        } catch {
+            alertMessage = AlertMessage(message: "导出失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func scrollToOutputButtons(_ proxy: ScrollViewProxy) {
+        // 延后一帧，等键盘弹出/焦点切换引发的布局完成后，再滚动到按钮行
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            withAnimation {
+                proxy.scrollTo("outputButtons", anchor: .bottom)
+            }
+        }
     }
 
     // MARK: - 键盘避让（点击输出框时自动上移，保证复制/导出按钮可见）
@@ -539,19 +552,26 @@ struct SpeedCell: View {
     private var dlText: String {
         guard let job = job else { return "" }
         if job.done {
-            if let d = job.resultDl { return "↓ \(String(format: "%.1f", d)) MB/s" }
+            if let d = job.resultDl { return "↓ \(fmtSpeed(d))" }
             return "↓ 失败"
         }
-        return "↓ \(String(format: "%.1f", job.dlSpeed)) MB/s"
+        return "↓ \(fmtSpeed(job.dlSpeed))"
     }
 
     private var ulText: String {
         guard let job = job else { return "" }
         if job.done {
-            if let u = job.resultUl { return "↑ \(String(format: "%.1f", u)) MB/s" }
+            if let u = job.resultUl { return "↑ \(fmtSpeed(u))" }
             return "↑ 失败"
         }
-        return "↑ \(String(format: "%.1f", job.ulSpeed)) MB/s"
+        return "↑ \(fmtSpeed(job.ulSpeed))"
+    }
+
+    /// 速度显示：小于 1MB/s 时用 KB/s 展示，避免“0.0 MB/s”掩盖真实的低速
+    private func fmtSpeed(_ mb: Double) -> String {
+        if mb <= 0 { return "0.0 KB/s" }
+        if mb < 1.0 { return String(format: "%.0f", mb * 1000) + " KB/s" }
+        return String(format: "%.1f", mb) + " MB/s"
     }
 
     private func start() {
@@ -624,30 +644,6 @@ struct ShareSheet: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
-}
-
-// MARK: - 文本文件文档（供系统“存储到文件”导出使用）
-
-struct TextFileDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.plainText] }
-    var text: String
-
-    init(text: String = "") {
-        self.text = text
-    }
-
-    init(configuration: ReadConfiguration) throws {
-        if let data = configuration.file.regularFileContents,
-           let t = String(data: data, encoding: .utf8) {
-            text = t
-        } else {
-            text = ""
-        }
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: Data(text.utf8))
-    }
 }
 
 // MARK: - 告警消息

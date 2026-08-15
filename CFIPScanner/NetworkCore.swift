@@ -319,12 +319,13 @@ private func speedOpen(ip: String, port: Int, timeout: TimeInterval, sni: String
     return nil
 }
 
-/// 通过 ip:port 下载约 20MB，返回平均下载速度(MB/s)，失败返回 nil。
-/// 从发送请求那一刻开始计时，并丢弃前 1MB 预热数据，排除 VPN/系统缓冲突发，
-/// 使结果更接近真实持续吞吐（避免“几 KB/s 的真实网速被算成十几 MB/s”的失真）。
+/// 通过 ip:port 下载，返回平均下载速度(MB/s)，失败返回 nil。
+/// 采用「预热 + 固定时间窗口」测量：先预热 1.5 秒丢弃缓冲突发，再连续测量 10 秒，
+/// 统计窗口内实际收到的字节数。无论网速快慢（哪怕只有几 KB/s）都能得到结果，
+/// 不会因为“固定字节量 + 超时上限”而在低速时直接判失败。
 func downloadSpeed(ip: String,
                    port: Int,
-                   maxBytes: Int = 20_000_000,
+                   maxBytes: Int = 50_000_000,
                    timeout: TimeInterval = 15,
                    sni: String = "speed.cloudflare.com",
                    progress: ((Int, Double) -> Void)? = nil) -> Double? {
@@ -338,14 +339,28 @@ func downloadSpeed(ip: String,
               "Connection: close\r\n\r\n"
     guard let reqData = req.data(using: .utf8), tls.write(reqData) else { return nil }
 
-    // 从发送请求那一刻开始计时（不等到响应头结束，避免把缓冲突发算进真实吞吐）
-    var total = 0
-    var measured = false
+    let warmupDuration = 1.5   // 预热：丢弃这段时间内的缓冲突发
+    let measureDuration = 10.0 // 正式测量窗口
     var headerDone = false
     var headerBuf = Data()
-    let warmupBytes = 1_000_000   // 丢弃前 1MB，消除 VPN/系统缓冲突发
-    var t0 = DispatchTime.now().uptimeNanoseconds
+    var measuredTotal = 0
+    var measureStartNanos: UInt64? = nil
+    let t0 = DispatchTime.now().uptimeNanoseconds
     var lastCb = 0.0
+
+    // 处理响应体：预热期内不计入，进入正式窗口后累计字节
+    func accumulate(_ bytes: Data) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let totalElapsed = Double(now - t0) / 1_000_000_000.0
+        if measureStartNanos == nil {
+            if totalElapsed >= warmupDuration {
+                measureStartNanos = now
+                measuredTotal = 0
+            }
+        } else {
+            measuredTotal += bytes.count
+        }
+    }
 
     while true {
         let data = tls.read(maxLen: 65536)
@@ -358,42 +373,45 @@ func downloadSpeed(ip: String,
                 let body = headerBuf.subdata(in: range.upperBound..<headerBuf.count)
                 headerBuf = Data()
                 headerDone = true
-                total += body.count
+                accumulate(body)
             } else {
                 continue
             }
         } else {
-            total += data.count
+            accumulate(data)
         }
 
-        // 预热：累计达到 warmupBytes 后才重新开始正式计时与计数
-        if !measured && total >= warmupBytes {
-            total = 0
-            t0 = DispatchTime.now().uptimeNanoseconds
-            measured = true
+        let now = DispatchTime.now().uptimeNanoseconds
+        let totalElapsed = Double(now - t0) / 1_000_000_000.0
+        if let start = measureStartNanos {
+            let mElapsed = Double(now - start) / 1_000_000_000.0
+            if let progress = progress, mElapsed - lastCb >= 0.5 {
+                lastCb = mElapsed
+                progress(measuredTotal, mElapsed)
+            }
+            if mElapsed >= measureDuration { break }
+            if measuredTotal >= maxBytes { break }
+        } else if totalElapsed > 60 {
+            break   // 长时间连预热数据都没凑够，避免无限等待
         }
-
-        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000.0
-        if let progress = progress, measured, elapsed - lastCb >= 0.5 {
-            lastCb = elapsed
-            progress(total, elapsed)
-        }
-        if measured && total >= maxBytes { break }
-        if elapsed > 20 { break }
     }
 
-    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000.0
-    if !measured || elapsed <= 0 || total <= 0 { return nil }
-    let mbPerSec = (Double(total) / 1000.0 / 1000.0) / elapsed
+    guard let start = measureStartNanos else { return nil }
+    let now = DispatchTime.now().uptimeNanoseconds
+    let mElapsed = Double(now - start) / 1_000_000_000.0
+    if mElapsed <= 0 || measuredTotal <= 0 { return nil }
+    let mbPerSec = (Double(measuredTotal) / 1000.0 / 1000.0) / mElapsed
     return (mbPerSec * 10).rounded() / 10
 }
 
 // MARK: - 上传测速
 
-/// 通过 ip:port 向 Cloudflare 上传约 20MB，返回平均上传速度(MB/s)，失败返回 nil
+/// 通过 ip:port 向 Cloudflare 上传，返回平均上传速度(MB/s)，失败返回 nil。
+/// 与下载一致，采用「预热 + 固定时间窗口」测量，统计窗口内实际写出的字节数，
+/// 避免把写入本地内核缓冲区的“瞬时突发”误算成真实上行速度。
 func uploadSpeed(ip: String,
                  port: Int,
-                 maxBytes: Int = 20_000_000,
+                 maxBytes: Int = 50_000_000,
                  timeout: TimeInterval = 15,
                  sni: String = "speed.cloudflare.com",
                  progress: ((Int, Double) -> Void)? = nil) -> Double? {
@@ -410,24 +428,43 @@ func uploadSpeed(ip: String,
 
     let chunk = [UInt8](repeating: 48, count: 65536) // 字符 "0"
     let chunkData = Data(chunk)
-    var total = 0
+    let warmupDuration = 1.5   // 预热：丢弃突发
+    let measureDuration = 8.0  // 正式测量窗口
+    var measuredTotal = 0
+    var measureStartNanos: UInt64? = nil
     let t0 = DispatchTime.now().uptimeNanoseconds
     var lastCb = 0.0
 
-    while total < maxBytes {
-        if !tls.write(chunkData) { break }
-        total += chunk.count
+    while true {
+        let nowBefore = DispatchTime.now().uptimeNanoseconds
+        let totalElapsed = Double(nowBefore - t0) / 1_000_000_000.0
 
-        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000.0
-        if let progress = progress, elapsed - lastCb >= 0.5 {
-            lastCb = elapsed
-            progress(total, elapsed)
+        if measureStartNanos == nil && totalElapsed >= warmupDuration {
+            measureStartNanos = nowBefore
+            measuredTotal = 0
         }
-        if elapsed > 12 { break }
+
+        if !tls.write(chunkData) { break }
+
+        if let start = measureStartNanos {
+            measuredTotal += chunk.count
+            let now = DispatchTime.now().uptimeNanoseconds
+            let mElapsed = Double(now - start) / 1_000_000_000.0
+            if let progress = progress, mElapsed - lastCb >= 0.5 {
+                lastCb = mElapsed
+                progress(measuredTotal, mElapsed)
+            }
+            if mElapsed >= measureDuration { break }
+            if measuredTotal >= maxBytes { break }
+        } else if totalElapsed > 60 {
+            break   // 长时间未进入正式测量，避免无限等待
+        }
     }
 
-    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000.0
-    if elapsed <= 0 || total <= 0 { return nil }
-    let mbPerSec = (Double(total) / 1000.0 / 1000.0) / elapsed
+    guard let start = measureStartNanos else { return nil }
+    let now = DispatchTime.now().uptimeNanoseconds
+    let mElapsed = Double(now - start) / 1_000_000_000.0
+    if mElapsed <= 0 || measuredTotal <= 0 { return nil }
+    let mbPerSec = (Double(measuredTotal) / 1000.0 / 1000.0) / mElapsed
     return (mbPerSec * 10).rounded() / 10
 }
