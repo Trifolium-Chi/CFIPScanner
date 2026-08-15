@@ -232,9 +232,11 @@ final class Scanner: ObservableObject {
         if deltaDone > 0 { done += deltaDone }
         if !newResults.isEmpty {
             results.append(contentsOf: newResults)
-            // 扫描进行中：每出现一个可用 IP，立即异步检测真实地区
+            // 扫描进行中：仅对「无地区标注」的 IP 异步在线补全真实地区。
+            // 文件里已标注地区（#香港 / HK / 香港 等）的 IP 保留文件标注，
+            // 不再被在线库覆盖，避免 Cloudflare anycast IP 被国际库误判。
             for r in newResults {
-                detectRegion(for: r.ip)
+                if r.cc.isEmpty { detectRegion(for: r.ip) }
             }
         }
         statusText = "正在扫描 \(done)/\(total)"

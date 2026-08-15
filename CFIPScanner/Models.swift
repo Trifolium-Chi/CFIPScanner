@@ -131,7 +131,72 @@ func sortRegionOpts(_ opts: [RegionOption]) -> [RegionOption] {
 
 // MARK: - 解析
 
-/// 解析单行，返回 IpItem；无法解析返回 nil
+/// 中文地区简称别名（CC_CN 中只存了“中国香港/中国澳门/中国台湾”，
+/// 但导入文件里常直接写“香港/澳门/台湾”）
+private let CN_ALIAS: [String: String] = [
+    "香港": "HK", "澳门": "MO", "台湾": "TW",
+]
+
+/// 英文地区名 -> 国家代码（按“整词”精确匹配，避免误判）
+private let CC_ENGLISH_TOKEN: [String: String] = [
+    "HONGKONG": "HK", "MACAU": "MO", "MACAO": "MO",
+    "USA": "US", "AMERICA": "US", "JAPAN": "JP",
+    "SINGAPORE": "SG", "GERMANY": "DE", "NETHERLANDS": "NL",
+    "ENGLAND": "GB", "UK": "GB", "TAIWAN": "TW", "CHINA": "CN",
+    "RUSSIA": "RU", "CANADA": "CA", "AUSTRALIA": "AU", "INDIA": "IN",
+    "KOREA": "KR", "FRANCE": "FR", "FINLAND": "FI", "SWEDEN": "SE",
+    "TURKEY": "TR", "POLAND": "PL", "ITALY": "IT", "SPAIN": "ES",
+]
+
+/// 英文多词地区名（紧凑成无空格大写后 contains 匹配，仅长度较长者，
+/// 避免短词误伤普通英文单词）
+private let CC_ENGLISH_MULTI: [String: String] = [
+    "HONGKONG": "HK", "UNITEDSTATES": "US", "UNITEDKINGDOM": "GB",
+    "SOUTHKOREA": "KR",
+]
+
+/// 从注释中识别地区并返回国家代码；无法识别返回空字符串。
+/// 与分隔符无关：无论注释用 #、-、,、:、|、/、空格、括号等分隔，
+/// 只要出现“香港/HK/Hong Kong”等关键词即可命中。
+/// 识别优先级：中文地区名 > 英文全称 > 独立两位国家代码。
+func extractCC(from comment: String) -> String {
+    guard !comment.isEmpty else { return "" }
+
+    // 1) 中文地区名（长优先，避免“中国”误命中“中国香港”）
+    let cnSorted = CC_CN.sorted { $0.value.count > $1.value.count }
+    for (code, name) in cnSorted {
+        if comment.contains(name) { return code }
+    }
+    for (alias, code) in CN_ALIAS {
+        if comment.contains(alias), CC_CN[code] != nil { return code }
+    }
+
+    // 2) 英文全称：分离连续字母片段（大小写不敏感）
+    let letterRuns = comment.map { $0.isLetter ? String($0) : " " }.joined()
+    let tokens = letterRuns.split(separator: " ").map { String($0).uppercased() }
+
+    // 2a) 整词精确匹配
+    for token in tokens {
+        if let code = CC_ENGLISH_TOKEN[token], CC_CN[code] != nil { return code }
+    }
+
+    // 2b) 多词全称：紧凑后 contains（如 "Hong Kong" -> "HONGKONG"）
+    let compact = comment.uppercased().filter { $0.isLetter }
+    for (name, code) in CC_ENGLISH_MULTI {
+        if name.count >= 6, compact.contains(name), CC_CN[code] != nil { return code }
+    }
+
+    // 3) 独立两位国家代码片段（如 "443-HK" -> "HK"、"443,US" -> "US"）
+    for token in tokens {
+        if CC_CN[token] != nil { return token }
+    }
+
+    return ""
+}
+
+/// 解析单行，返回 IpItem；无法解析返回 nil。
+/// 支持 IP:端口 后带或不带注释，注释可用 #、-、,、:、|、/、空格、括号等分隔；
+/// 地区从注释中识别（中文地区名 / 英文全称 / 独立两位国家代码），与分隔符无关。
 func parseLine(_ rawLine: String) -> IpItem? {
     var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
     if line.isEmpty || line.hasPrefix("#") { return nil }
@@ -139,41 +204,44 @@ func parseLine(_ rawLine: String) -> IpItem? {
     if let r = line.range(of: "://") {
         line = String(line[r.upperBound...])
     }
-    // 以 # 分隔主体与注释
-    let main: String
-    var comment = ""
-    if let idx = line.firstIndex(of: "#") {
-        main = String(line[..<idx]).trimmingCharacters(in: .whitespacesAndNewlines)
-        comment = String(line[line.index(after: idx)...])
-    } else {
-        main = line
-    }
-    // 主体形如 IP 或 IP:端口（不支持 IPv6）
-    let comps = main.split(separator: ":", omittingEmptySubsequences: false)
-    guard comps.count >= 1, comps.count <= 2, let ipStr = comps.first else { return nil }
-    // 校验 IP：4 段，每段 0-255 且不超过 3 位数字
+
+    // 提取首个 IPv4（前 4 段数字，不支持 IPv6）
+    let pattern = "\\d{1,3}(\\.\\d{1,3}){3}"
+    guard let ipRange = line.range(of: pattern, options: .regularExpression) else { return nil }
+    let ipStr = String(line[ipRange])
+    // 校验 IP：每段 0-255 且不超过 3 位数字
     let octets = ipStr.split(separator: ".")
     guard octets.count == 4 else { return nil }
     for o in octets {
         let s = String(o)
-        // 仅接受 1-3 位纯数字，且 0-255
         guard s.count >= 1, s.count <= 3,
               s.allSatisfy({ $0 >= "0" && $0 <= "9" }),
               let v = Int(s), v <= 255 else { return nil }
     }
-    let ip = String(ipStr)
-    // 端口
+    let ip = ipStr
+
+    // IP 之后的部分：可能以 :端口 开头，其余全部视为注释
+    let rest = String(line[ipRange.upperBound...])
     var port = 443
-    if comps.count == 2 {
-        let portStr = String(comps[1])
-        guard portStr.count >= 1, portStr.count <= 5,
-              portStr.allSatisfy({ $0 >= "0" && $0 <= "9" }),
-              let p = Int(portStr), p > 0, p <= 65535 else { return nil }
-        port = p
+    var comment = ""
+    if rest.hasPrefix(":") {
+        let afterColon = String(rest.dropFirst())
+        var digitStr = ""
+        for ch in afterColon {
+            if ch.isNumber { digitStr.append(ch) } else { break }
+        }
+        if let p = Int(digitStr), p > 0, p <= 65535 {
+            port = p
+            comment = String(afterColon.dropFirst(digitStr.count))
+        } else {
+            // 冒号后无有效端口：整段视为注释（如 "91.110.174.202:香港"）
+            comment = rest
+        }
+    } else {
+        comment = rest
     }
-    // cc = 注释中的前两个 ASCII 字母（对应 Python 的 re.sub(r"[^A-Za-z]","",comment)[:2].upper()）
-    let letters = comment.filter { ($0 >= "a" && $0 <= "z") || ($0 >= "A" && $0 <= "Z") }
-    let cc = String(letters.prefix(2)).uppercased()
+
+    let cc = extractCC(from: comment)
     return IpItem(ip: ip, port: port, cc: cc)
 }
 
