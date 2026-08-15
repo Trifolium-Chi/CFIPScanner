@@ -44,9 +44,9 @@ struct ContentView: View {
     // 输出文本编辑焦点（仅在该文本框聚焦且键盘弹出时，才自动滚动到输出框）
     @FocusState private var isEditingOutput: Bool
 
-    // 导出
-    @State private var showShareSheet = false
-    @State private var exportURL: URL?
+    // 导出（系统“存储到文件”，可选择保存位置）
+    @State private var showExporter = false
+    @State private var exportText = ""
 
     // 关于工具翻页（无手势滑动，仅按钮切换）
     @State private var showAbout = false
@@ -84,9 +84,15 @@ struct ContentView: View {
             Alert(title: Text("提示"), message: Text(msg.message),
                   dismissButton: .default(Text("好")))
         }
-        .sheet(isPresented: $showShareSheet) {
-            if let url = exportURL {
-                ShareSheet(items: [url])
+        .fileExporter(isPresented: $showExporter,
+                      document: TextFileDocument(text: exportText),
+                      contentType: .plainText,
+                      defaultFilename: "可用IP.txt") { result in
+            switch result {
+            case .success:
+                alertMessage = AlertMessage(message: "导出成功")
+            case .failure(let error):
+                alertMessage = AlertMessage(message: "导出失败：\(error.localizedDescription)")
             }
         }
         .sheet(isPresented: $showPasteSheet) {
@@ -152,30 +158,18 @@ struct ContentView: View {
                         settingsCard
                         resultsCard
                         outputCard
-                            .id("outputCard")
                     }
                     .padding()
-                    .padding(.bottom, keyboardHeight)
                 }
                 .onChange(of: keyboardHeight) { h in
                     if h > 0 && isEditingOutput {
                         withAnimation {
-                            proxy.scrollTo("outputCard", anchor: .bottom)
+                            proxy.scrollTo("outputButtons", anchor: .bottom)
                         }
                     }
                 }
             }
             .navigationBarTitle("优选 IP 筛选工具", displayMode: .inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        export()
-                    } label: {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                    .disabled(scanner.displayResults().isEmpty)
-                }
-            }
         }
         .navigationViewStyle(StackNavigationViewStyle())
     }
@@ -393,6 +387,7 @@ struct ContentView: View {
             HStack {
                 Button("复制") {
                     UIPasteboard.general.string = outputEditableText
+                    alertMessage = AlertMessage(message: "已复制至粘贴板")
                 }
                 .buttonStyle(FilledButtonStyle(color: .cfBlue))
                 .disabled(outputEditableText.isEmpty)
@@ -404,6 +399,7 @@ struct ContentView: View {
                 Button("关于工具") { showAbout = true }
                     .buttonStyle(FilledButtonStyle(color: .cfGray))
             }
+            .id("outputButtons")
         }
         .padding()
         .background(Color(.secondarySystemBackground))
@@ -477,15 +473,8 @@ struct ContentView: View {
         let arr = scanner.displayResults()
         guard !arr.isEmpty else { return }
         let lines = arr.map { exportLine($0, isp: scanner.isp) }
-        let text = lines.joined(separator: "\r\n") + "\r\n"
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("可用IP.txt")
-        do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
-            exportURL = url
-            showShareSheet = true
-        } catch {
-            alertMessage = AlertMessage(message: "导出失败：\(error.localizedDescription)")
-        }
+        exportText = lines.joined(separator: "\r\n") + "\r\n"
+        showExporter = true
     }
 
     // MARK: - 键盘避让（点击输出框时自动上移，保证复制/导出按钮可见）
@@ -635,6 +624,30 @@ struct ShareSheet: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+// MARK: - 文本文件文档（供系统“存储到文件”导出使用）
+
+struct TextFileDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.plainText] }
+    var text: String
+
+    init(text: String = "") {
+        self.text = text
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        if let data = configuration.file.regularFileContents,
+           let t = String(data: data, encoding: .utf8) {
+            text = t
+        } else {
+            text = ""
+        }
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(text.utf8))
+    }
 }
 
 // MARK: - 告警消息

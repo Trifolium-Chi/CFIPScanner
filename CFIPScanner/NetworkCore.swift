@@ -273,13 +273,15 @@ private func connectRetry(ip: String, port: Int, timeout: TimeInterval, attempts
 }
 
 /// 用系统 DNS 解析域名，返回第一个 IPv4 地址（自动适配当前网络：开 VPN 走 VPN，关 VPN 走直连）
-private func resolveIPv4(_ host: String) -> String? {
+/// 用系统 DNS 解析域名，返回全部 IPv4 地址（自动适配当前网络：开 VPN 走 VPN，关 VPN 走直连）
+private func resolveIPv4List(_ host: String) -> [String] {
     var hints = addrinfo()
     hints.ai_family = AF_INET
     hints.ai_socktype = SOCK_STREAM
     var res: UnsafeMutablePointer<addrinfo>?
-    guard getaddrinfo(host, nil, &hints, &res) == 0, let list = res else { return nil }
+    guard getaddrinfo(host, nil, &hints, &res) == 0, let list = res else { return [] }
     defer { freeaddrinfo(list) }
+    var out: [String] = []
     var ptr: UnsafeMutablePointer<addrinfo>? = list
     while let info = ptr {
         if info.pointee.ai_family == AF_INET, let aiAddr = info.pointee.ai_addr {
@@ -287,40 +289,47 @@ private func resolveIPv4(_ host: String) -> String? {
             var buf = [CChar](repeating: 0, count: 64)
             var a = addr.sin_addr
             if let p = inet_ntop(AF_INET, &a, &buf, socklen_t(buf.count)) {
-                return String(cString: p)
+                out.append(String(cString: p))
             }
         }
         ptr = info.pointee.ai_next
     }
-    return nil
+    return out
 }
 
-/// 测速连接：优先直连指定 IP；若当前网络下不可达，则回退到解析测速站域名，
-/// 保证开关 VPN 都能测得当前手机网络的真实网速。
-private func speedConnect(ip: String, port: Int, timeout: TimeInterval) -> Int32? {
-    if let r = connectRetry(ip: ip, port: port, timeout: timeout) { return r.fd }
-    if let resolved = resolveIPv4("speed.cloudflare.com"),
-       let r = connectRetry(ip: resolved, port: port, timeout: timeout) {
-        return r.fd
+/// 建立可用的测速 TLS 连接：依次尝试指定 IP 与域名解析出的全部 IPv4，
+/// 任一候选完成 TCP 连接 + TLS 握手即返回；全部失败返回 nil。
+/// 这样即使关闭 VPN 后指定 IP 不可达或握手失败，也能回退到域名解析 IP，
+/// 保证测出当前手机网络的实际网速。
+private func speedOpen(ip: String, port: Int, timeout: TimeInterval, sni: String) -> TLSSocket? {
+    var candidates = [ip]
+    candidates.append(contentsOf: resolveIPv4List("speed.cloudflare.com"))
+    var seen: Set<String> = []
+    for cand in candidates {
+        if seen.contains(cand) { continue }
+        seen.insert(cand)
+        guard let r = connectRetry(ip: cand, port: port, timeout: timeout) else { continue }
+        if let tls = TLSSocket(fd: r.fd, sni: sni, timeout: timeout) {
+            if tls.handshake() { return tls }
+            tls.close()
+        } else {
+            Darwin.close(r.fd)
+        }
     }
     return nil
 }
 
-/// 通过 ip:port 下载约 50MB，返回平均下载速度(MB/s)，失败返回 nil。
-/// 样本量从 10MB 提升到 50MB，摊平 VPN 前期突发缓冲，让结果更接近真实持续吞吐。
+/// 通过 ip:port 下载约 20MB，返回平均下载速度(MB/s)，失败返回 nil。
+/// 从发送请求那一刻开始计时，并丢弃前 1MB 预热数据，排除 VPN/系统缓冲突发，
+/// 使结果更接近真实持续吞吐（避免“几 KB/s 的真实网速被算成十几 MB/s”的失真）。
 func downloadSpeed(ip: String,
                    port: Int,
-                   maxBytes: Int = 50_000_000,
+                   maxBytes: Int = 20_000_000,
                    timeout: TimeInterval = 15,
                    sni: String = "speed.cloudflare.com",
                    progress: ((Int, Double) -> Void)? = nil) -> Double? {
-    guard let fd = speedConnect(ip: ip, port: port, timeout: timeout) else { return nil }
-    guard let tls = TLSSocket(fd: fd, sni: sni, timeout: timeout) else {
-        Darwin.close(fd)
-        return nil
-    }
+    guard let tls = speedOpen(ip: ip, port: port, timeout: timeout, sni: sni) else { return nil }
     defer { tls.close() }
-    guard tls.handshake() else { return nil }
 
     let req = "GET /__down?bytes=\(maxBytes) HTTP/1.1\r\n" +
               "Host: speed.cloudflare.com\r\n" +
@@ -329,9 +338,12 @@ func downloadSpeed(ip: String,
               "Connection: close\r\n\r\n"
     guard let reqData = req.data(using: .utf8), tls.write(reqData) else { return nil }
 
+    // 从发送请求那一刻开始计时（不等到响应头结束，避免把缓冲突发算进真实吞吐）
     var total = 0
+    var measured = false
     var headerDone = false
     var headerBuf = Data()
+    let warmupBytes = 1_000_000   // 丢弃前 1MB，消除 VPN/系统缓冲突发
     var t0 = DispatchTime.now().uptimeNanoseconds
     var lastCb = 0.0
 
@@ -346,24 +358,32 @@ func downloadSpeed(ip: String,
                 let body = headerBuf.subdata(in: range.upperBound..<headerBuf.count)
                 headerBuf = Data()
                 headerDone = true
-                t0 = DispatchTime.now().uptimeNanoseconds
                 total += body.count
+            } else {
+                continue
             }
         } else {
             total += data.count
         }
 
+        // 预热：累计达到 warmupBytes 后才重新开始正式计时与计数
+        if !measured && total >= warmupBytes {
+            total = 0
+            t0 = DispatchTime.now().uptimeNanoseconds
+            measured = true
+        }
+
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000.0
-        if let progress = progress, elapsed - lastCb >= 0.5 {
+        if let progress = progress, measured, elapsed - lastCb >= 0.5 {
             lastCb = elapsed
             progress(total, elapsed)
         }
-        if total >= maxBytes { break }
+        if measured && total >= maxBytes { break }
         if elapsed > 20 { break }
     }
 
     let elapsed = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000_000.0
-    if elapsed <= 0 || total <= 0 { return nil }
+    if !measured || elapsed <= 0 || total <= 0 { return nil }
     let mbPerSec = (Double(total) / 1000.0 / 1000.0) / elapsed
     return (mbPerSec * 10).rounded() / 10
 }
@@ -377,13 +397,8 @@ func uploadSpeed(ip: String,
                  timeout: TimeInterval = 15,
                  sni: String = "speed.cloudflare.com",
                  progress: ((Int, Double) -> Void)? = nil) -> Double? {
-    guard let fd = speedConnect(ip: ip, port: port, timeout: timeout) else { return nil }
-    guard let tls = TLSSocket(fd: fd, sni: sni, timeout: timeout) else {
-        Darwin.close(fd)
-        return nil
-    }
+    guard let tls = speedOpen(ip: ip, port: port, timeout: timeout, sni: sni) else { return nil }
     defer { tls.close() }
-    guard tls.handshake() else { return nil }
 
     let req = "POST /__up HTTP/1.1\r\n" +
               "Host: speed.cloudflare.com\r\n" +
