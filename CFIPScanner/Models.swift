@@ -155,6 +155,11 @@ private let CC_ENGLISH_MULTI: [String: String] = [
     "SOUTHKOREA": "KR",
 ]
 
+/// 中文地区名按长度降序（提前算好，避免每条 IP 行都重新排序，减少导入卡顿）
+private let CN_SORTED: [(code: String, name: String)] = CC_CN
+    .sorted { $0.value.count > $1.value.count }
+    .map { ($0.key, $0.value) }
+
 /// 从注释中识别地区并返回国家代码；无法识别返回空字符串。
 /// 与分隔符无关：无论注释用 #、-、,、:、|、/、空格、括号等分隔，
 /// 只要出现“香港/HK/Hong Kong”等关键词即可命中。
@@ -163,8 +168,7 @@ func extractCC(from comment: String) -> String {
     guard !comment.isEmpty else { return "" }
 
     // 1) 中文地区名（长优先，避免“中国”误命中“中国香港”）
-    let cnSorted = CC_CN.sorted { $0.value.count > $1.value.count }
-    for (code, name) in cnSorted {
+    for (code, name) in CN_SORTED {
         if comment.contains(name) { return code }
     }
     for (alias, code) in CN_ALIAS {
@@ -205,10 +209,11 @@ func parseLine(_ rawLine: String) -> IpItem? {
         line = String(line[r.upperBound...])
     }
 
-    // 提取首个 IPv4（前 4 段数字，不支持 IPv6）
-    let pattern = "\\d{1,3}(\\.\\d{1,3}){3}"
-    guard let ipRange = line.range(of: pattern, options: .regularExpression) else { return nil }
-    let ipStr = String(line[ipRange])
+    // 提取行首的 IP 部分：连续的数字与点（不支持 IPv6），
+    // 手写字符扫描代替正则，避免大文件导入时逐行编译正则导致卡顿。
+    let ipPrefix = line.prefix { $0.isNumber || $0 == "." }
+    guard !ipPrefix.isEmpty else { return nil }
+    let ipStr = String(ipPrefix)
     // 校验 IP：每段 0-255 且不超过 3 位数字
     let octets = ipStr.split(separator: ".")
     guard octets.count == 4 else { return nil }
@@ -221,7 +226,7 @@ func parseLine(_ rawLine: String) -> IpItem? {
     let ip = ipStr
 
     // IP 之后的部分：可能以 :端口 开头，其余全部视为注释
-    let rest = String(line[ipRange.upperBound...])
+    let rest = String(line.dropFirst(ipPrefix.count))
     var port = 443
     var comment = ""
     if rest.hasPrefix(":") {
